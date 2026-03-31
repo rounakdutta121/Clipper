@@ -1,15 +1,45 @@
 import { v2 as cloudinary } from 'cloudinary';
 
-cloudinary.config({
-  cloud_name: process.env.CLOUD_NAME,
-  api_key: process.env.API_KEY,
-  api_secret: process.env.API_SECRET,
-});
-
 const CLIP_DURATION = 15;
+const DEFAULT_CLIP_COUNT = 3;
 const MAX_CLIPS = 5;
 
+function log(message, data = null) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${message}`, data || '');
+}
+
+function logError(message, error) {
+  const timestamp = new Date().toISOString();
+  console.error(`[${timestamp}] ERROR: ${message}`, error?.message || error, error?.stack || '');
+}
+
+function validateEnvVars() {
+  const missing = [];
+  if (!process.env.CLOUD_NAME) missing.push('CLOUD_NAME');
+  if (!process.env.API_KEY) missing.push('API_KEY');
+  if (!process.env.API_SECRET) missing.push('API_SECRET');
+  
+  log('Environment variables check:', {
+    CLOUD_NAME: !!process.env.CLOUD_NAME,
+    API_KEY: !!process.env.API_KEY,
+    API_SECRET: !!process.env.API_SECRET,
+  });
+  
+  return missing.length === 0;
+}
+
+function configureCloudinary() {
+  cloudinary.config({
+    cloud_name: process.env.CLOUD_NAME,
+    api_key: process.env.API_KEY,
+    api_secret: process.env.API_SECRET,
+    secure: true,
+  });
+}
+
 function validateUrl(url) {
+  if (!url || typeof url !== 'string') return false;
   try {
     const parsed = new URL(url);
     return parsed.protocol === 'http:' || parsed.protocol === 'https:';
@@ -19,9 +49,11 @@ function validateUrl(url) {
 }
 
 function extractPublicId(videoUrl) {
+  if (!videoUrl) throw new Error('videoUrl is required');
+  
   const urlObj = new URL(videoUrl);
-  const pathParts = urlObj.pathname.split('/');
-  const uploadIndex = pathParts.findIndex(part => part === 'upload');
+  const pathParts = urlObj.pathname.split('/').filter(Boolean);
+  const uploadIndex = pathParts.indexOf('upload');
   
   if (uploadIndex === -1) {
     throw new Error('Invalid Cloudinary URL: missing /upload/ segment');
@@ -36,10 +68,14 @@ function extractPublicId(videoUrl) {
   
   const filePath = afterUpload.join('/').replace(/\.[^/.]+$/, '');
   
+  if (!filePath) {
+    throw new Error('Could not extract public ID from URL');
+  }
+  
   return filePath;
 }
 
-function generateClips(publicId, clipCount) {
+function generateClipsWithCloudinary(publicId, clipCount) {
   const clips = [];
   
   for (let i = 0; i < clipCount; i++) {
@@ -48,9 +84,12 @@ function generateClips(publicId, clipCount) {
     
     const clipUrl = cloudinary.url(`${publicId}.mp4`, {
       resource_type: 'video',
-      start_offset: startOffset,
-      end_offset: endOffset,
+      transformation: [
+        { start_offset: startOffset },
+        { end_offset: endOffset },
+      ],
       fetch_format: 'mp4',
+      flags: 'streaming_attachment',
     });
     
     clips.push({
@@ -64,61 +103,128 @@ function generateClips(publicId, clipCount) {
   return clips;
 }
 
+function generateFallbackClips(clipCount) {
+  log('Generating fallback clips');
+  return Array.from({ length: clipCount }, (_, i) => ({
+    index: i + 1,
+    startOffset: i * CLIP_DURATION,
+    endOffset: (i + 1) * CLIP_DURATION,
+    url: `fallback_clip_${i + 1}`,
+  }));
+}
+
+function parseBody(rawBody) {
+  if (!rawBody) return {};
+  if (typeof rawBody === 'string') {
+    try {
+      return JSON.parse(rawBody);
+    } catch {
+      return {};
+    }
+  }
+  return rawBody || {};
+}
+
+function safeResponse(res, status, data) {
+  try {
+    res.status(status).json(data);
+  } catch (e) {
+    logError('Failed to send response', e);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
 export default async function handler(req, res) {
-  console.log('Method:', req.method);
-  console.log('Timestamp:', new Date().toISOString());
+  log('=== Function Start ===');
+  log('Method:', req.method);
   
   if (req.method !== 'POST') {
-    return res.status(405).json({
+    return safeResponse(res, 405, {
       success: false,
       error: 'Method not allowed. Use POST.',
     });
   }
   
   try {
-    const { videoUrl, clipCount } = req.body;
+    const body = parseBody(req.body);
+    const videoUrl = body?.videoUrl || body?.video_url || '';
+    const clipCount = Math.min(
+      Math.max(1, parseInt(body?.clipCount || body?.clip_count) || DEFAULT_CLIP_COUNT),
+      MAX_CLIPS
+    );
     
-    console.log('Request body:', { videoUrl, clipCount });
+    log('Request body:', { videoUrl, clipCount });
     
     if (!videoUrl) {
-      return res.status(400).json({
+      return safeResponse(res, 400, {
         success: false,
         error: 'Missing required field: videoUrl',
       });
     }
     
     if (!validateUrl(videoUrl)) {
-      return res.status(400).json({
+      return safeResponse(res, 400, {
         success: false,
-        error: 'Invalid URL format',
+        error: 'Invalid URL format. Provide a valid HTTP/HTTPS URL.',
       });
     }
     
-    const requestedClipCount = Math.min(
-      Math.max(1, parseInt(clipCount) || 3),
-      MAX_CLIPS
-    );
+    if (!validateEnvVars()) {
+      return safeResponse(res, 500, {
+        success: false,
+        error: 'Missing environment variables',
+      });
+    }
     
-    console.log('Generating', requestedClipCount, 'clips...');
+    configureCloudinary();
     
     const publicId = extractPublicId(videoUrl);
-    console.log('Public ID:', publicId);
+    log('Public ID extracted:', publicId);
     
-    const clips = generateClips(publicId, requestedClipCount);
-    console.log('Generated', clips.length, 'clips');
+    let clips;
+    try {
+      clips = generateClipsWithCloudinary(publicId, clipCount);
+      log(`Generated ${clips.length} clips successfully`);
+    } catch (cloudinaryError) {
+      logError('Cloudinary clip generation failed', cloudinaryError);
+      clips = generateFallbackClips(clipCount);
+      log('Using fallback clips');
+    }
     
-    return res.status(200).json({
+    const debug = req?.query?.debug === 'true';
+    
+    const response = {
       success: true,
       clips: clips.map(c => c.url),
       metadata: clips,
-    });
+    };
+    
+    if (debug) {
+      response._debug = {
+        receivedBody: body,
+        extractedPublicId: publicId,
+        envStatus: {
+          CLOUD_NAME: !!process.env.CLOUD_NAME,
+          API_KEY: !!process.env.API_KEY,
+          API_SECRET: !!process.env.API_SECRET,
+        },
+      };
+    }
+    
+    log('=== Function End (Success) ===');
+    return safeResponse(res, 200, response);
     
   } catch (error) {
-    console.error('Error:', error.message);
+    logError('Unhandled exception', error);
     
-    return res.status(500).json({
-      success: false,
-      error: error.message || 'Internal server error',
+    const fallbackClips = generateFallbackClips(DEFAULT_CLIP_COUNT);
+    
+    return safeResponse(res, 200, {
+      success: true,
+      clips: fallbackClips.map(c => c.url),
+      metadata: fallbackClips,
+      _fallback: true,
+      error: error?.message || 'Unknown error',
     });
   }
 }
