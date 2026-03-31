@@ -1,8 +1,5 @@
 {
   "name": "clipper-api",
   "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "cloudinary": "^2.5.0"
-  }
+  "type": "module"
 }
