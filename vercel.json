@@ -1,9 +1,7 @@
 {
-  "framework": "vercel",
   "functions": {
-    "api/upload.js": {
-      "memory": 128,
-      "maxDuration": 10
+    "api/*.js": {
+      "runtime": "@vercel/node"
     }
   }
 }
